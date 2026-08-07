@@ -324,6 +324,7 @@ IMPORTANT:
                 "type": "web_search",
             }
         ],
+        tool_choice="required",
         input=prompt,
         text={
             "format": {
