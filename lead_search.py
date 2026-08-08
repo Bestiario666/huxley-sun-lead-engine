@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 LEADS_TAB = "Leads"
 SONGS_TAB = "Songs"
 MIN_SCORE = 80
-ENGINE_VERSION = "HS-EMAIL-COST-V6-20260808"
+ENGINE_VERSION = "HS-EMAIL-CONTACT-FIRST-V7-20260808"
 
 PLATFORM_TARGETS = {
     "Instagram": 30,
@@ -29,21 +29,19 @@ PLATFORM_TARGETS = {
     "TikTok": 10,
 }
 
-# COST-CONTROLLED DISCOVERY.
-# We allow ONE paid web-discovery response for Instagram and ONE for TikTok.
-# Email enrichment itself uses direct website crawling and costs $0 in OpenAI.
-INSTAGRAM_DISCOVERY_PER_CALL = 80
-TIKTOK_DISCOVERY_PER_CALL = 45
-YOUTUBE_RESULTS_PER_QUERY = 15
-SCORE_BATCH_SIZE = 30
-MAX_FREE_EMAIL_CANDIDATES_PER_PLATFORM = {
-    "Instagram": 90,
-    "YouTube": 80,
-    "TikTok": 55,
-}
-MAX_PAGES_PER_SITE = 5
-HTTP_TIMEOUT_SECONDS = 7
-MAX_WEB_SEARCH_TOOL_CALLS_SOFT = 20
+# COST-CONTROLLED CONTACT-FIRST DISCOVERY.
+# This version targets 60 NEW rows per run: 30 Instagram / 20 YouTube / 10 TikTok.
+# Every NEW discovery lead must already have a public email + source URL BEFORE scoring.
+# At most 6 paid web Responses are allowed (initial + one refill per platform),
+# and each response is capped at 3 built-in web-search calls via max_tool_calls.
+SCORE_BATCH_SIZE = 25
+MAX_WEB_RESPONSES = 6
+MAX_TOOL_CALLS_PER_WEB_RESPONSE = 3
+INITIAL_DISCOVERY_MULTIPLIER = 2
+REFILL_DISCOVERY_MULTIPLIER = 3
+MAX_DISCOVERY_RESULTS_PER_RESPONSE = 60
+MAX_PAGES_PER_SITE = 4
+HTTP_TIMEOUT_SECONDS = 6
 MAX_EXISTING_FREE_ENRICH = 120
 
 # Cost-conscious model split:
@@ -209,6 +207,7 @@ usage_totals = {
     "gpt-5-nano": {"input_tokens": 0, "output_tokens": 0},
     "gpt-5.6-luna": {"input_tokens": 0, "output_tokens": 0},
     "web_search_calls": 0,
+    "web_responses": 0,
 }
 
 
@@ -250,7 +249,8 @@ def print_usage():
             f"{model}: input={data.get('input_tokens', 0):,} "
             f"output={data.get('output_tokens', 0):,}"
         )
-    print(f"Web-search tool calls: {usage_totals['web_search_calls']}")
+    print(f"Paid web Responses used: {usage_totals['web_responses']}/{MAX_WEB_RESPONSES}")
+    print(f"Web-search tool calls: {usage_totals['web_search_calls']} (hard ceiling {MAX_WEB_RESPONSES * MAX_TOOL_CALLS_PER_WEB_RESPONSE})")
     print(f"Estimated OpenAI cost this run: ${estimated_openai_cost():.4f}")
 
 
@@ -1011,10 +1011,10 @@ def search_youtube():
 
 
 # ============================================================
-# INSTAGRAM / TIKTOK DISCOVERY
+# CONTACT-FIRST WEB DISCOVERY (ALL THREE PLATFORMS)
 # ============================================================
 
-SOCIAL_SCHEMA = {
+CONTACT_SCHEMA = {
     "type": "object",
     "properties": {
         "leads": {
@@ -1023,7 +1023,7 @@ SOCIAL_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "creator": {"type": "string"},
-                    "platform": {"type": "string", "enum": ["Instagram", "TikTok"]},
+                    "platform": {"type": "string", "enum": ["Instagram", "YouTube", "TikTok"]},
                     "profile_url": {"type": "string"},
                     "followers": {"type": "string"},
                     "country": {"type": "string"},
@@ -1047,88 +1047,131 @@ SOCIAL_SCHEMA = {
 }
 
 
-def social_discovery(platform, focus, count):
-    if usage_totals["web_search_calls"] >= MAX_WEB_SEARCH_TOOL_CALLS_SOFT:
-        print(f"Skipping paid {platform} discovery: soft web-search budget reached.")
+def profile_matches_platform(url, platform):
+    if not valid_http_url(url):
+        return False
+    try:
+        host = urlparse(str(url).strip()).netloc.lower().split(":")[0]
+    except Exception:
+        return False
+    allowed = {
+        "Instagram": ("instagram.com",),
+        "YouTube": ("youtube.com", "youtu.be"),
+        "TikTok": ("tiktok.com",),
+    }
+    return any(host == d or host.endswith("." + d) for d in allowed.get(platform, ()))
+
+
+def verified_contact_lead(lead):
+    """Hard requirement for NEW discovery leads."""
+    return (
+        lead.get("platform") in PLATFORM_TARGETS
+        and profile_matches_platform(lead.get("profile_url", ""), lead.get("platform", ""))
+        and valid_email(lead.get("email"))
+        and valid_http_url(lead.get("email_source_url"))
+    )
+
+
+def platform_focus(platform):
+    common = (
+        "cinematic travel films, road films, short films, documentary and human-interest work, "
+        "analog/nostalgic visual storytelling, night-city or street films, landscape films, "
+        "cinematic automotive work, restrained fashion/editorial films, slow visual storytelling"
+    )
+    if platform == "YouTube":
+        return common + "; prioritize independent channels/filmmakers who publish a business email on an official site or public contact page"
+    if platform == "TikTok":
+        return common + "; prioritize creators who also have an official portfolio/site with a public business email"
+    return common + "; prioritize creators with an official portfolio/site and public business email"
+
+
+def contact_first_discovery(platform, requested_count, exclude_names=None, pass_label="initial"):
+    if requested_count <= 0:
         return []
-    print(f"Discovering {platform}: {focus}")
+    if usage_totals["web_responses"] >= MAX_WEB_RESPONSES:
+        print(f"Skipping {platform} {pass_label} discovery: paid web-response ceiling reached.")
+        return []
+
+    count = max(12, min(MAX_DISCOVERY_RESULTS_PER_RESPONSE, int(requested_count)))
+    exclusions = sorted(list(exclude_names or []))[:80]
+    exclusion_text = ", ".join(exclusions) if exclusions else "none"
+
+    print(
+        f"Contact-first {platform} discovery ({pass_label}): "
+        f"requesting up to {count} verified-email candidates..."
+    )
+
     prompt = f"""
 {HUXLEY_BRIEF}
 
-Find up to {count} DISTINCT, real, currently active {platform} visual creators.
-Focus: {focus}
+Find up to {count} DISTINCT, real, currently active {platform} creators who are realistic
+music-placement outreach prospects.
 
-Prefer filmmakers, cinematic travel creators, visual storytellers,
-photographers who actively make video/reels, documentary creators,
-short-film directors, art-film creators and cinematic automotive creators.
-Generally favor reachable independent/small-to-mid-size creators over celebrities.
+Creative focus:
+{platform_focus(platform)}
 
-Return concise evidence only. This is DISCOVERY, not a biography-writing task.
+CRITICAL CONTACT-FIRST RULE:
+- ONLY return a creator if you can verify a PUBLIC PROFESSIONAL/BUSINESS EMAIL ADDRESS.
+- Every returned lead MUST have a valid email AND email_source_url.
+- email_source_url must be the exact public page where that email is shown (official website,
+  official contact/about page, portfolio, management/representation page, or the creator's
+  own public profile page if the email is actually visible there).
+- Never guess an email from a domain or naming pattern.
+- Never invent a source URL.
+- If you cannot verify the email, OMIT the creator entirely. Do not return blank-email rows.
+- profile_url must be the direct real {platform} profile/channel URL.
+- contact_url should be the creator's official website/contact/portfolio page when available.
+- Prefer reachable independent and small-to-mid-size creators, but include larger creators
+  when the fit and public contact route are unusually strong.
+- Exclude musicians-only accounts, music reviewers, repost farms, fan pages, generic companies,
+  and creators whose work is not genuinely useful for music placement.
+- Keep recent_content and content_type concise; no biographies.
+- Avoid these already-known creator normalized names where possible: {exclusion_text}
 
-Rules:
-- Use web search.
-- platform must be exactly {platform}.
-- profile_url must be the direct real {platform} profile URL.
-- Never invent a creator, username, follower count, country, URL or email.
-- IMPORTANT COST RULE: use no more than THREE web-search queries total for this entire response.
-  Do NOT run a separate search for each creator.
-- Prioritize creators whose official website / portfolio / contact page can be identified
-  in the same broad search, because our code will crawl those pages directly for email later.
-- If a public professional/business email happens to be visible in the same search results,
-  include it AND the exact public page URL where it is shown. Do NOT perform extra searches for email.
-- If email or source is uncertain/unavailable, leave BOTH blank.
-- email_source_url must never be a search-results URL; it must be a public page
-  belonging to or clearly representing the creator/business where the email is published.
-- Exclude fan pages, repost farms, meme pages, generic corporations, music reviewers,
-  musicians-only accounts, and accounts whose content is not genuinely useful for music placement.
-- No markdown citations in fields. Plain text/URLs only.
+Use web search efficiently. This response is capped programmatically at
+{MAX_TOOL_CALLS_PER_WEB_RESPONSE} total web-search calls, so search broadly and return only verified contacts.
 """
 
-    response = openai_client.responses.create(
-        model=WEB_MODEL,
-        reasoning={"effort": "none"},
-        tools=[{"type": "web_search", "search_context_size": "low"}],
-        tool_choice="required",
-        input=prompt,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "social_creator_discovery",
-                "schema": SOCIAL_SCHEMA,
-                "strict": True,
-            }
-        },
-        store=False,
-    )
-    record_openai_usage(response, WEB_MODEL)
-    data = json.loads(response.output_text)
+    usage_totals["web_responses"] += 1
+    try:
+        response = openai_client.responses.create(
+            model=WEB_MODEL,
+            reasoning={"effort": "none"},
+            tools=[{"type": "web_search", "search_context_size": "low"}],
+            tool_choice="required",
+            max_tool_calls=MAX_TOOL_CALLS_PER_WEB_RESPONSE,
+            max_output_tokens=12000,
+            input=prompt,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "contact_first_creator_discovery",
+                    "schema": CONTACT_SCHEMA,
+                    "strict": True,
+                }
+            },
+            store=False,
+        )
+        record_openai_usage(response, WEB_MODEL)
+        data = json.loads(response.output_text)
+    except Exception as exc:
+        print(f"{platform} {pass_label} web discovery failed safely: {type(exc).__name__}: {exc}")
+        return []
 
-    leads = []
-    for lead in data.get("leads", []):
-        if lead.get("platform") != platform:
+    good = []
+    rejected = 0
+    for raw in data.get("leads", []):
+        lead = {k: (str(v).strip() if v is not None else "") for k, v in raw.items()}
+        if lead.get("platform") != platform or not verified_contact_lead(lead):
+            rejected += 1
             continue
-        # If only one of email/source exists, discard both. We will verify later.
-        if not email_ready(lead):
-            lead["email"] = ""
-            lead["email_source_url"] = ""
-        lead["website_candidates"] = [
-            lead.get("contact_url", "")
-        ] if valid_http_url(lead.get("contact_url", "")) else []
-        leads.append(lead)
-    return leads
+        good.append(lead)
 
-
-def initial_social_discovery(remaining_targets):
-    leads = []
-    if remaining_targets.get("Instagram", 0) > 0:
-        count = max(30, min(INSTAGRAM_DISCOVERY_PER_CALL, remaining_targets["Instagram"] * 4))
-        for focus in INSTAGRAM_FOCUSES:
-            leads.extend(social_discovery("Instagram", focus, count))
-    if remaining_targets.get("TikTok", 0) > 0:
-        count = max(20, min(TIKTOK_DISCOVERY_PER_CALL, remaining_targets["TikTok"] * 4))
-        for focus in TIKTOK_FOCUSES:
-            leads.extend(social_discovery("TikTok", focus, count))
-    return leads
+    print(
+        f"{platform} {pass_label}: {len(good)} verified-email candidates accepted"
+        + (f"; {rejected} rejected by hard contact validation." if rejected else ".")
+    )
+    return good
 
 
 # ============================================================
@@ -1215,6 +1258,7 @@ CANDIDATES:
     response = openai_client.responses.create(
         model=SCORE_MODEL,
         input=prompt,
+        max_output_tokens=9000,
         text={
             "format": {
                 "type": "json_schema",
@@ -1295,86 +1339,35 @@ def score_candidates(candidates, songs):
 
 
 # ============================================================
-# EMAIL ENRICHMENT - FREE WEBSITE CRAWLING + HARD REQUIREMENT
+# FINAL PLATFORM SELECTION
 # ============================================================
 
 
-def enrich_until_target(platform_pool, target):
-    """Return up to target leads, using no paid OpenAI email-search calls."""
-    selected = []
-    max_candidates = 0
-    if platform_pool:
-        max_candidates = MAX_FREE_EMAIL_CANDIDATES_PER_PLATFORM.get(
-            platform_pool[0].get("platform", ""), len(platform_pool)
-        )
-
-    for idx, lead in enumerate(platform_pool[:max_candidates], 1):
-        if len(selected) >= target:
-            break
-
-        if email_ready(lead):
-            selected.append(lead)
-            continue
-
-        if idx == 1 or idx % 10 == 0:
-            print(
-                f"Free website email crawl {lead.get('platform', '')}: "
-                f"candidate {idx}/{min(len(platform_pool), max_candidates)}"
-            )
-
-        email, source_url, contact_url = find_public_email_free(lead)
-        if valid_email(email) and valid_http_url(source_url):
-            lead["email"] = email
-            lead["email_source_url"] = source_url
-            if valid_http_url(contact_url):
-                lead["contact_url"] = contact_url
-            selected.append(lead)
-        else:
-            lead["email"] = ""
-            lead["email_source_url"] = ""
-
-    return selected[:target]
-
-
-# ============================================================
-# PLATFORM QUOTAS - NO PAID EMAIL FALLBACK
-# ============================================================
-
-
-def add_candidate_ids(candidates, start=1):
-    for i, lead in enumerate(candidates, start):
-        lead["candidate_id"] = f"C{i:04d}"
-    return candidates
-
-
-def select_final_leads(scored, songs, existing_urls, existing_names, targets):
-    del songs, existing_urls, existing_names  # kept in signature for compatibility
-    final_by_platform = {p: [] for p in PLATFORM_TARGETS}
-
-    for platform, target in targets.items():
+def select_platform_targets(scored):
+    final = []
+    counts = {p: 0 for p in PLATFORM_TARGETS}
+    for platform in ["Instagram", "YouTube", "TikTok"]:
         pool = [
             x for x in scored
-            if x.get("platform") == platform and x.get("match_score", 0) >= MIN_SCORE
+            if x.get("platform") == platform
+            and x.get("match_score", 0) >= MIN_SCORE
+            and verified_contact_lead(x)
         ]
-        print(
-            f"{platform}: {len(pool)} score-{MIN_SCORE}+ candidates before email filter."
+        pool.sort(
+            key=lambda x: (x.get("match_score", 0), x.get("song_match_score", 0)),
+            reverse=True,
         )
-        if pool:
-            final_by_platform[platform] = enrich_until_target(pool, target)
-        print(
-            f"{platform}: {len(final_by_platform[platform])}/{target} "
-            "with public email found by direct website crawl."
-        )
+        chosen = pool[:PLATFORM_TARGETS[platform]]
+        counts[platform] = len(chosen)
+        final.extend(chosen)
+    return final, counts
 
-    print(
-        "No paid per-candidate email search is allowed. "
-        "If a platform is short, the run stops short instead of spending more."
-    )
 
-    final = []
-    for platform in ["Instagram", "YouTube", "TikTok"]:
-        final.extend(final_by_platform[platform])
-    return final
+def shortages_from_counts(counts):
+    return {
+        p: max(0, PLATFORM_TARGETS[p] - int(counts.get(p, 0)))
+        for p in PLATFORM_TARGETS
+    }
 
 
 # ============================================================
@@ -1385,15 +1378,16 @@ def select_final_leads(scored, songs, existing_urls, existing_names, targets):
 def append_to_sheet(leads):
     headers = ensure_lead_headers()
 
-    # FINAL HARD GATE: impossible for an email-less lead to be written by this file.
+    # FINAL HARD GATE: every newly written row must have score >=80, a real email,
+    # a source URL, and a valid platform profile.
     clean = [
         lead for lead in leads
-        if lead.get("match_score", 0) >= MIN_SCORE and email_ready(lead)
+        if lead.get("match_score", 0) >= MIN_SCORE and verified_contact_lead(lead)
     ]
     rejected = len(leads) - len(clean)
     if rejected:
         print(
-            f"FINAL WRITE GUARD rejected {rejected} lead(s) missing score/email/source."
+            f"FINAL WRITE GUARD rejected {rejected} lead(s) missing score/email/source/platform validation."
         )
 
     if not clean:
@@ -1465,8 +1459,8 @@ def startup_self_check():
         raise RuntimeError(
             f"Unexpected Leads schema width: {len(REQUIRED_LEAD_HEADERS)} columns; expected 28."
         )
-    if len(INSTAGRAM_FOCUSES) != 1 or len(TIKTOK_FOCUSES) != 1:
-        raise RuntimeError("Cost guard failed: social discovery must be one broad response per platform.")
+    if MAX_WEB_RESPONSES != 6 or MAX_TOOL_CALLS_PER_WEB_RESPONSE != 3:
+        raise RuntimeError("Cost-ceiling constants changed unexpectedly.")
     print(f"ENGINE VERSION: {ENGINE_VERSION}")
     print("Startup self-check: PASS")
 
@@ -1474,100 +1468,121 @@ def startup_self_check():
 def main():
     startup_self_check()
     print("======================================")
-    print("HUXLEY SUN LEAD ENGINE - EMAIL MODE")
+    print("HUXLEY SUN LEAD ENGINE - CONTACT-FIRST EMAIL MODE")
     print("======================================")
-    print("Targets: Instagram 30 | YouTube 20 | TikTok 10")
-    print("Requirements: match score >= 80 + public email + email source URL")
-    print("Cost mode: only 2 social discovery responses; NO paid email-search stage.")
-    print("Emails are extracted by direct public website crawling ($0 OpenAI cost).")
-    print("No lead without BOTH email and source URL can be written to the sheet.")
+    print("Per-run NEW lead targets: Instagram 30 | YouTube 20 | TikTok 10")
+    print("Hard requirements: match score >= 80 + public email + exact email source URL")
+    print(
+        f"Hard paid-search ceiling: {MAX_WEB_RESPONSES} web Responses x "
+        f"{MAX_TOOL_CALLS_PER_WEB_RESPONSE} tool calls = "
+        f"{MAX_WEB_RESPONSES * MAX_TOOL_CALLS_PER_WEB_RESPONSE} max web-search calls."
+    )
+    print("Existing rows are used ONLY for deduplication; they do NOT satisfy this run's 60-new-lead target.")
 
+    # Fail before any paid OpenAI request if Sheets or Songs are broken.
     verify_sheet_before_spending()
     songs = load_songs()
-
-    # Reuse what you already paid to discover before spending anything new.
-    inventory = enrich_existing_pipeline_free()
-    remaining_targets = {
-        platform: max(0, PLATFORM_TARGETS[platform] - inventory.get(platform, 0))
-        for platform in PLATFORM_TARGETS
-    }
-    print(
-        "Remaining inventory needed: "
-        + " | ".join(f"{p} {remaining_targets[p]}" for p in ["Instagram", "YouTube", "TikTok"])
-    )
-
-    if not any(remaining_targets.values()):
-        print("Email-ready inventory already meets 30/20/10. No paid discovery needed.")
-        print_usage()
-        return
+    print("Active songs loaded: " + ", ".join(s["song"] for s in songs))
 
     existing_urls, existing_names = get_existing_leads()
-    print(f"Existing lead URLs in sheet: {len(existing_urls)}")
+    print(f"Existing lead URLs in sheet (dedupe only): {len(existing_urls)}")
 
-    youtube_leads = search_youtube() if remaining_targets.get("YouTube", 0) > 0 else []
-    social_leads = initial_social_discovery(remaining_targets)
-    print(f"Instagram/TikTok raw candidates found: {len(social_leads)}")
+    # PASS 1: contact-first discovery. No email-less candidate is sent to scoring.
+    discovered = []
+    for platform in ["Instagram", "YouTube", "TikTok"]:
+        request_count = min(
+            MAX_DISCOVERY_RESULTS_PER_RESPONSE,
+            PLATFORM_TARGETS[platform] * INITIAL_DISCOVERY_MULTIPLIER,
+        )
+        discovered.extend(
+            contact_first_discovery(
+                platform,
+                request_count,
+                exclude_names=existing_names,
+                pass_label="initial",
+            )
+        )
 
-    raw = youtube_leads + social_leads
-    candidates = dedupe_candidates(raw, existing_urls, existing_names)
-    add_candidate_ids(candidates)
-    print(f"New raw candidates after deduplication: {len(candidates)}")
+    candidates = dedupe_candidates(discovered, existing_urls, existing_names)
+    candidates = [x for x in candidates if verified_contact_lead(x)]
+    print(f"Verified-email NEW candidates before scoring: {len(candidates)}")
 
     scored = score_candidates(candidates, songs)
-    qualified = [x for x in scored if x.get("match_score", 0) >= MIN_SCORE]
-    print(f"Score-{MIN_SCORE}+ candidates before email filter: {len(qualified)}")
+    final, counts = select_platform_targets(scored)
+    shortages = shortages_from_counts(counts)
 
-    final = select_final_leads(
-        qualified,
-        songs,
-        existing_urls,
-        existing_names,
-        remaining_targets,
+    print(
+        "After initial scoring: "
+        + " | ".join(
+            f"{p} {counts[p]}/{PLATFORM_TARGETS[p]}"
+            for p in ["Instagram", "YouTube", "TikTok"]
+        )
     )
 
-    # Absolute last assertion before the side effect.
-    bad = [x for x in final if not email_ready(x)]
-    if bad:
-        raise RuntimeError(
-            f"Internal safety check failed: {len(bad)} final leads lack verified email/source."
-        )
+    # PASS 2: one bounded refill per short platform, still contact-first.
+    if any(shortages.values()) and usage_totals["web_responses"] < MAX_WEB_RESPONSES:
+        seen_urls = existing_urls | {normalize_url(x.get("profile_url", "")) for x in candidates}
+        seen_names = existing_names | {normalize_name(x.get("creator", "")) for x in candidates}
+        refill_raw = []
+        for platform in ["Instagram", "YouTube", "TikTok"]:
+            need = shortages[platform]
+            if need <= 0:
+                continue
+            request_count = min(
+                MAX_DISCOVERY_RESULTS_PER_RESPONSE,
+                max(12, need * REFILL_DISCOVERY_MULTIPLIER),
+            )
+            refill_raw.extend(
+                contact_first_discovery(
+                    platform,
+                    request_count,
+                    exclude_names=seen_names,
+                    pass_label="refill",
+                )
+            )
 
-    counts = {
-        platform: sum(1 for x in final if x.get("platform") == platform)
-        for platform in PLATFORM_TARGETS
-    }
+        refill = dedupe_candidates(refill_raw, seen_urls, seen_names)
+        refill = [x for x in refill if verified_contact_lead(x)]
+        print(f"Verified-email refill candidates before scoring: {len(refill)}")
+        refill_scored = score_candidates(refill, songs)
+        scored.extend(refill_scored)
+        final, counts = select_platform_targets(scored)
+        shortages = shortages_from_counts(counts)
+
+    # Last, independent safety assertion before writing.
+    invalid = [x for x in final if not verified_contact_lead(x) or x.get("match_score", 0) < MIN_SCORE]
+    if invalid:
+        raise RuntimeError(
+            f"Internal safety check failed: {len(invalid)} selected rows violate email/source/score rules."
+        )
 
     print("\n======================================")
-    print("FINAL EMAIL-READY RESULTS")
+    print("FINAL NEW EMAIL-READY RESULTS")
     print("======================================")
-    for platform in PLATFORM_TARGETS:
-        print(
-            f"NEW {platform}: {counts[platform]}/{remaining_targets[platform]} needed "
-            f"(existing ready: {inventory[platform]})"
-        )
-    ready_after = {p: inventory[p] + counts[p] for p in PLATFORM_TARGETS}
-    print(
-        "Email-ready inventory after run: "
-        + " | ".join(f"{p} {ready_after[p]}/{PLATFORM_TARGETS[p]}" for p in ["Instagram", "YouTube", "TikTok"])
-    )
-    print(f"New email-ready leads found: {len(final)}")
+    for platform in ["Instagram", "YouTube", "TikTok"]:
+        print(f"{platform}: {counts[platform]}/{PLATFORM_TARGETS[platform]}")
+    print(f"Total NEW rows ready to write: {len(final)}/60")
 
     for lead in final:
         print(
             f"{lead.get('match_score', 0):>3} | "
             f"{lead.get('platform', ''):<9} | "
-            f"{lead.get('creator', '')[:34]:<34} | "
+            f"{lead.get('creator', '')[:32]:<32} | "
             f"{lead.get('email', '')}"
         )
 
+    # IMPORTANT: write whatever valid results were actually found; do not require all 60.
     written = append_to_sheet(final)
     print(f"Rows actually written: {written}")
     print_usage()
 
-    if any(ready_after[p] < PLATFORM_TARGETS[p] for p in PLATFORM_TARGETS):
-        print("\nNOTE: The engine did NOT lower the score or email standard to force 60.")
-        print("Any shortage means free website crawling did not find enough public emails.")
-        print("The engine intentionally did not spend more money to force the quota.")
+    if any(shortages.values()):
+        print("\nNOTE: The run wrote every verified score-80+ email lead it found.")
+        print(
+            "Remaining shortage: "
+            + " | ".join(f"{p} {shortages[p]}" for p in ["Instagram", "YouTube", "TikTok"])
+        )
+        print("It did not lower quality or exceed the hard web-search ceiling to force 60.")
 
 
 if __name__ == "__main__":
