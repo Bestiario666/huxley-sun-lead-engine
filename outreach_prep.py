@@ -55,7 +55,7 @@ from openai import OpenAI
 # VERSION / CONFIG
 # ============================================================
 
-ENGINE_VERSION = "HS-OUTREACH-PREP-V2-20260808"
+ENGINE_VERSION = "HS-OUTREACH-PREP-V3-NO-LICENSING-20260808"
 
 LEADS_TAB = "Leads"
 SONGS_TAB = "Songs"
@@ -225,6 +225,48 @@ def require_env(name: str) -> str:
 
 def clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+FORBIDDEN_OUTREACH_TERMS = (
+    "license",
+    "licence",
+    "licensing",
+    "licencing",
+    "royalty",
+    "royalties",
+    "sync rights",
+    "clearance",
+)
+
+
+def remove_licensing_language(value: Any) -> str:
+    """Drop any sentence/line that contains licensing-style language.
+
+    This is a deterministic final guard after model generation.
+    """
+    text = clean(value)
+    if not text:
+        return ""
+
+    # Treat line breaks as boundaries too so a bad standalone line disappears.
+    chunks = re.split(r"(?<=[.!?])\s+|\n+", text)
+    kept = []
+
+    for chunk in chunks:
+        piece = chunk.strip()
+        if not piece:
+            continue
+
+        low = piece.lower()
+        if any(term in low for term in FORBIDDEN_OUTREACH_TERMS):
+            continue
+
+        kept.append(piece)
+
+    cleaned = " ".join(kept)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;!?])", r"\1", cleaned)
+    return cleaned.strip()
 
 
 def normalize_email(value: str) -> str:
@@ -1046,7 +1088,15 @@ def draft_batch(batch: list[dict[str, Any]], songs: list[dict[str, str]]) -> lis
 You are preparing polished, thoughtful cold outreach for Huxley Sun, an independent music project with a cinematic, reflective catalogue.
 The recipient is a filmmaker, photographer, director, or visual creator who may use music in future work.
 
-The purpose of the email is relationship-building, not a hard sell. Explain the aim clearly: Huxley Sun is selectively reaching out to visual creators whose work genuinely feels compatible with the music, with the hope that the catalogue may find a natural place in future films, documentaries, reels, travel pieces, branded films, or other visual projects. The message should feel personal, credible, artist-to-artist, and open to a long-term creative connection rather than a generic music pitch.
+The purpose of the email is relationship-building, not a hard sell. Explain the aim clearly: Huxley Sun is selectively reaching out to visual creators whose work genuinely feels compatible with the music, with the hope that the songs may naturally become part of future reels, posts, short visual pieces, travel films, documentaries, or other creative work. The message should feel personal, credible, artist-to-artist, and open to a long-term creative connection rather than a generic music pitch.
+
+IMPORTANT OUTREACH POSITIONING:
+- The creator should feel free to use the suggested Huxley Sun track in a reel or social post if it fits their work.
+- Do NOT mention licensing, licences, royalties, fees, contracts, permissions, clearance, sync rights, or "discussing usage."
+- Do NOT say or imply that the creator needs to contact Huxley Sun before using the music in a reel or post.
+- The Spotify link is a listening/reference link. Do not tell the creator to rip, download, extract, record, or otherwise copy audio from Spotify.
+- A natural sentence is: "If it fits something you're making, feel free to use it in a reel or post."
+
 
 Use ONLY the supplied creator data and ACTIVE SONG catalogue. Do not invent projects, awards, locations, clients, or things you supposedly watched.
 
@@ -1068,11 +1118,13 @@ For every lead:
    - Introduce Huxley Sun briefly as an independent music project.
    - Clearly explain the purpose of reaching out: to connect with visual creators whose work feels genuinely compatible with the catalogue, not simply to promote a release.
    - Mention the chosen song as a specific example that felt naturally suited to their visual language.
-   - Make clear that the broader aim is potential future use in films, documentaries, reels, branded pieces, or other visual work when the fit is right.
-   - Invite them to listen without pressure. Say you'd be glad to discuss usage/licensing if a track ever suits a project, and that you're equally happy simply to stay on their radar for future work.
+   - Make clear that the broader aim is for the music to find a natural place in future reels, posts, films, documentaries, branded pieces, or other visual work when the fit is right.
+   - Invite them to listen without pressure. If the track fits something they are making, explicitly tell them they are welcome to use it in a reel or social post.
+   - Do NOT mention licensing, licences, royalties, fees, contracts, permissions, clearance, sync rights, or discussing usage.
+   - Do NOT imply they need to ask Huxley Sun before using the music in a reel or post.
    - Keep the tone assured, restrained, intelligent and artist-to-artist. Avoid hype, flattery, marketing language, desperation, or overexplaining.
    - Do NOT say you watched/saw a specific piece unless Recent Content actually names it.
-   - Do NOT claim the music is royalty-free or free to use.
+   - Do NOT tell them to download, rip, extract, or record audio from Spotify.
    - Do NOT include any URLs; Python adds the verified song and optional more-music links afterward.
    - Do NOT include social handles or a signature; Python adds them consistently.
 7. Write one gentle 35-60 word follow-up. It should briefly resurface the original note, mention the song/project fit naturally, and leave the door open without guilt, urgency, pressure, URLs, social handles, or signature.
@@ -1157,7 +1209,7 @@ def apply_song_links_and_final_text(leads: list[dict[str, Any]], songs: list[dic
             body += f"\nMore music: {song['more_music_url']}"
         body += "\n\nBest,\nHuxley Sun\nInstagram / TikTok / Facebook: @huxleysun"
 
-        follow = clean(lead.get("follow_up_core")).rstrip()
+        follow = remove_licensing_language(lead.get("follow_up_core")).rstrip()
         if follow and not follow.lower().startswith("hi "):
             follow = f"Hi {lead.get('greeting_name') or first_name_guess(lead['creator'])},\n\n" + follow
         follow += "\n\nBest,\nHuxley Sun\nInstagram / TikTok / Facebook: @huxleysun"
