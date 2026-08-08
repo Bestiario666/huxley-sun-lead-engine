@@ -19,6 +19,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      READY_REFILL_THRESHOLD: "30"
 
     steps:
       - name: Check out repository
@@ -35,11 +36,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Validate outreach prep
+      - name: Validate manual prep files
         run: |
           test -f outreach_prep.py
-          python -m py_compile outreach_prep.py
-          echo "Outreach prep validation: PASS"
+          test -f pipeline_gate.py
+
+          python -m py_compile \
+            outreach_prep.py \
+            pipeline_gate.py
+
+          echo "Manual prep validation: PASS"
 
       - name: Prepare outreach drafts
         run: python outreach_prep.py
+
+      - name: Report resulting READY queue
+        run: python pipeline_gate.py

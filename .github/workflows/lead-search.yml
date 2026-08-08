@@ -41,7 +41,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Validate pipeline files before doing anything
+      - name: Validate all pipeline files before API work
         run: |
           test -f lead_search.py
           test -f outreach_prep.py
@@ -54,29 +54,38 @@ jobs:
 
           echo "Pipeline file validation: PASS"
 
-      # Always prepare any currently waiting NEW leads first.
-      # This costs no web-search calls in your current outreach_prep.py.
-      - name: Prepare existing NEW leads
-        run: python outreach_prep.py
-
-      # The gate checks the actual READY queue after preparation.
-      - name: Check whether READY queue needs refill
-        id: gate
+      - name: Check READY queue before doing any AI work
+        id: gate_before
         run: python pipeline_gate.py
 
-      - name: Queue healthy - skip paid discovery
-        if: steps.gate.outputs.run_discovery == 'false'
+      - name: Healthy queue - no AI work needed
+        if: ${{ steps.gate_before.outputs.run_discovery == 'false' }}
         run: |
-          echo "READY queue: ${{ steps.gate.outputs.ready_count }}"
+          echo "Sendable READY queue: ${{ steps.gate_before.outputs.ready_count }}"
+          echo "Skipping outreach prep."
+          echo "Skipping paid discovery."
+
+      - name: Prepare existing NEW leads
+        if: ${{ steps.gate_before.outputs.run_discovery == 'true' }}
+        run: python outreach_prep.py
+
+      - name: Recheck READY queue after prep
+        if: ${{ steps.gate_before.outputs.run_discovery == 'true' }}
+        id: gate_after_prep
+        run: python pipeline_gate.py
+
+      - name: Existing leads refilled queue - skip discovery
+        if: ${{ steps.gate_before.outputs.run_discovery == 'true' && steps.gate_after_prep.outputs.run_discovery == 'false' }}
+        run: |
+          echo "Existing NEW leads were enough."
           echo "Paid discovery skipped."
 
-      # Maximum one paid discovery run per scheduled pipeline execution.
       - name: Run lead discovery once
-        if: steps.gate.outputs.run_discovery == 'true'
+        if: ${{ steps.gate_before.outputs.run_discovery == 'true' && steps.gate_after_prep.outputs.run_discovery == 'true' }}
         run: python lead_search.py
 
       - name: Prepare newly discovered leads
-        if: steps.gate.outputs.run_discovery == 'true'
+        if: ${{ steps.gate_before.outputs.run_discovery == 'true' && steps.gate_after_prep.outputs.run_discovery == 'true' }}
         run: python outreach_prep.py
 
       - name: Final READY queue report
