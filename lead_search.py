@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 LEADS_TAB = "Leads"
 SONGS_TAB = "Songs"
 MIN_SCORE = 80
-ENGINE_VERSION = "HS-EMAIL-COST-V5-20260808"
+ENGINE_VERSION = "HS-EMAIL-COST-V6-20260808"
 
 PLATFORM_TARGETS = {
     "Instagram": 30,
@@ -578,11 +578,81 @@ def column_letter(number):
     return result
 
 
+def get_sheet_properties(tab_name):
+    """Return sheetId and grid size for a tab, raising if the tab is missing."""
+    result = sheets_execute(
+        lambda svc: svc.spreadsheets().get(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            includeGridData=False,
+            fields="sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
+        )
+    )
+    for item in result.get("sheets", []):
+        props = item.get("properties", {})
+        if props.get("title") == tab_name:
+            grid = props.get("gridProperties", {})
+            return {
+                "sheet_id": props.get("sheetId"),
+                "row_count": int(grid.get("rowCount", 0) or 0),
+                "column_count": int(grid.get("columnCount", 0) or 0),
+            }
+    raise RuntimeError(f"Google Sheet tab '{tab_name}' was not found.")
+
+
+def ensure_tab_capacity(tab_name, min_columns=None, min_rows=None):
+    """Expand a tab's grid before values.update/append touches cells outside it."""
+    props = get_sheet_properties(tab_name)
+    current_cols = props["column_count"]
+    current_rows = props["row_count"]
+    target_cols = max(current_cols, int(min_columns or current_cols or 1))
+    target_rows = max(current_rows, int(min_rows or current_rows or 1))
+
+    if target_cols == current_cols and target_rows == current_rows:
+        return props
+
+    fields = []
+    grid_properties = {}
+    if target_cols != current_cols:
+        grid_properties["columnCount"] = target_cols
+        fields.append("gridProperties.columnCount")
+    if target_rows != current_rows:
+        grid_properties["rowCount"] = target_rows
+        fields.append("gridProperties.rowCount")
+
+    sheets_execute(
+        lambda svc: svc.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body={
+                "requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": props["sheet_id"],
+                                "gridProperties": grid_properties,
+                            },
+                            "fields": ",".join(fields),
+                        }
+                    }
+                ]
+            },
+        )
+    )
+    print(
+        f"Expanded '{tab_name}' grid: "
+        f"columns {current_cols}->{target_cols}, rows {current_rows}->{target_rows}."
+    )
+    props["column_count"] = target_cols
+    props["row_count"] = target_rows
+    return props
+
+
 def ensure_lead_headers():
     rows = get_tab_values(LEADS_TAB, "1:1")
     existing = rows[0] if rows else []
 
     if not existing:
+        # A brand-new/empty tab may have fewer columns than the required schema.
+        ensure_tab_capacity(LEADS_TAB, min_columns=len(REQUIRED_LEAD_HEADERS))
         sheets_execute(
             lambda svc: svc.spreadsheets().values().update(
                 spreadsheetId=GOOGLE_SHEET_ID,
@@ -596,6 +666,10 @@ def ensure_lead_headers():
     missing = [h for h in REQUIRED_LEAD_HEADERS if h not in existing]
     if missing:
         start_col = len(existing) + 1
+        final_col_count = len(existing) + len(missing)
+        # Critical: values.update does NOT automatically expand a Sheets grid.
+        # Expand first, e.g. 27 columns (AA) -> 28 columns (AB).
+        ensure_tab_capacity(LEADS_TAB, min_columns=final_col_count)
         sheets_execute(
             lambda svc: svc.spreadsheets().values().update(
                 spreadsheetId=GOOGLE_SHEET_ID,
@@ -607,7 +681,16 @@ def ensure_lead_headers():
         existing = existing + missing
         print("Added Leads headers: " + ", ".join(missing))
 
-    return existing
+    # Verify the schema now, before any paid discovery can begin.
+    check = get_tab_values(LEADS_TAB, "1:1")
+    actual = check[0] if check else []
+    still_missing = [h for h in REQUIRED_LEAD_HEADERS if h not in actual]
+    if still_missing:
+        raise RuntimeError(
+            "Leads header verification failed after update. Missing: "
+            + ", ".join(still_missing)
+        )
+    return actual
 
 
 def verify_sheet_before_spending():
@@ -1378,6 +1461,10 @@ def startup_self_check():
         raise RuntimeError(f"Bad MIN_SCORE in code: {MIN_SCORE}")
     if "Email Source URL" not in REQUIRED_LEAD_HEADERS:
         raise RuntimeError("Email Source URL header missing from code.")
+    if len(REQUIRED_LEAD_HEADERS) != 28:
+        raise RuntimeError(
+            f"Unexpected Leads schema width: {len(REQUIRED_LEAD_HEADERS)} columns; expected 28."
+        )
     if len(INSTAGRAM_FOCUSES) != 1 or len(TIKTOK_FOCUSES) != 1:
         raise RuntimeError("Cost guard failed: social discovery must be one broad response per platform.")
     print(f"ENGINE VERSION: {ENGINE_VERSION}")
