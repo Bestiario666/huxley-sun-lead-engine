@@ -55,7 +55,7 @@ from openai import OpenAI
 # VERSION / CONFIG
 # ============================================================
 
-ENGINE_VERSION = "HS-OUTREACH-PREP-V1-20260808"
+ENGINE_VERSION = "HS-OUTREACH-PREP-V2-20260808"
 
 LEADS_TAB = "Leads"
 SONGS_TAB = "Songs"
@@ -68,8 +68,8 @@ MODEL_ATTEMPTS = 2
 # We only prepare leads whose existing overall match score is at least this.
 MIN_MATCH_SCORE = 80
 
-# Keep drafts short. This is outreach, not a press release.
-DRAFT_MAX_OUTPUT_TOKENS = 6500
+# Keep drafts polished but concise.
+DRAFT_MAX_OUTPUT_TOKENS = 8000
 CONTACT_MAX_OUTPUT_TOKENS = 3500
 
 # Approximate current nano pricing used only for the terminal estimate.
@@ -1043,8 +1043,10 @@ def draft_batch(batch: list[dict[str, Any]], songs: list[dict[str, str]]) -> lis
         })
 
     prompt = f"""
-You are preparing concise, respectful cold outreach for Huxley Sun, an independent music project.
-The goal is NOT to sell aggressively. The recipient is a filmmaker/photographer/visual creator who may use music in future work.
+You are preparing polished, thoughtful cold outreach for Huxley Sun, an independent music project with a cinematic, reflective catalogue.
+The recipient is a filmmaker, photographer, director, or visual creator who may use music in future work.
+
+The purpose of the email is relationship-building, not a hard sell. Explain the aim clearly: Huxley Sun is selectively reaching out to visual creators whose work genuinely feels compatible with the music, with the hope that the catalogue may find a natural place in future films, documentaries, reels, travel pieces, branded films, or other visual projects. The message should feel personal, credible, artist-to-artist, and open to a long-term creative connection rather than a generic music pitch.
 
 Use ONLY the supplied creator data and ACTIVE SONG catalogue. Do not invent projects, awards, locations, clients, or things you supposedly watched.
 
@@ -1059,17 +1061,21 @@ For every lead:
    - DIRECT contact slightly preferred to REPRESENTATIVE.
    Do not simply copy the existing match score.
 4. Choose a natural greeting name. For organizations use "there" if no person is obvious.
-5. Write a short subject, ideally 3-7 words, not clickbait and not salesy.
-6. Write a plain-text first email, about 65-105 words BEFORE links/signature are appended by Python.
+5. Write a refined subject, ideally 4-8 words. It should sound personal and professional, never clickbait, promotional, or salesy.
+6. Write a sophisticated but natural plain-text first email, about 95-145 words BEFORE links, social handle and signature are appended by Python.
    - Start with "Hi NAME,".
-   - Mention ONE concrete supplied aspect of their work.
-   - Say you make music as Huxley Sun and the chosen song felt compatible.
+   - Open with ONE concrete supplied aspect of their work and why it stood out as relevant.
+   - Introduce Huxley Sun briefly as an independent music project.
+   - Clearly explain the purpose of reaching out: to connect with visual creators whose work feels genuinely compatible with the catalogue, not simply to promote a release.
+   - Mention the chosen song as a specific example that felt naturally suited to their visual language.
+   - Make clear that the broader aim is potential future use in films, documentaries, reels, branded pieces, or other visual work when the fit is right.
+   - Invite them to listen without pressure. Say you'd be glad to discuss usage/licensing if a track ever suits a project, and that you're equally happy simply to stay on their radar for future work.
+   - Keep the tone assured, restrained, intelligent and artist-to-artist. Avoid hype, flattery, marketing language, desperation, or overexplaining.
    - Do NOT say you watched/saw a specific piece unless Recent Content actually names it.
    - Do NOT claim the music is royalty-free or free to use.
-   - Invite them to listen and say you'd be happy to discuss usage/licensing if it ever fits.
-   - Do NOT include any URLs; Python adds verified song links afterward.
-   - Do NOT include a signature; Python adds it.
-7. Write one gentle 30-55 word follow-up with no guilt, no urgency, no URLs and no signature.
+   - Do NOT include any URLs; Python adds the verified song and optional more-music links afterward.
+   - Do NOT include social handles or a signature; Python adds them consistently.
+7. Write one gentle 35-60 word follow-up. It should briefly resurface the original note, mention the song/project fit naturally, and leave the door open without guilt, urgency, pressure, URLs, social handles, or signature.
 
 All active Huxley Sun songs may be considered for short films and documentaries; Best For is additional guidance, not an exhaustive restriction.
 
@@ -1149,12 +1155,12 @@ def apply_song_links_and_final_text(leads: list[dict[str, Any]], songs: list[dic
         body += f"\n\n{primary}: {song['stream_url']}"
         if song.get("more_music_url"):
             body += f"\nMore music: {song['more_music_url']}"
-        body += "\n\nBest,\nHuxley Sun"
+        body += "\n\nBest,\nHuxley Sun\nInstagram / TikTok / Facebook: @huxleysun"
 
         follow = clean(lead.get("follow_up_core")).rstrip()
         if follow and not follow.lower().startswith("hi "):
             follow = f"Hi {lead.get('greeting_name') or first_name_guess(lead['creator'])},\n\n" + follow
-        follow += "\n\nBest,\nHuxley Sun"
+        follow += "\n\nBest,\nHuxley Sun\nInstagram / TikTok / Facebook: @huxleysun"
 
         lead["song_link"] = song["stream_url"]
         lead["more_music_link"] = song.get("more_music_url", "")
