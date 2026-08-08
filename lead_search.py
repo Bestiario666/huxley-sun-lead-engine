@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 LEADS_TAB = "Leads"
 SONGS_TAB = "Songs"
 MIN_SCORE = 80
-ENGINE_VERSION = "HS-EMAIL-CONTACT-FIRST-V7-20260808"
+ENGINE_VERSION = "HS-EMAIL-CONTACT-FIRST-V8-20260808"
 
 PLATFORM_TARGETS = {
     "Instagram": 30,
@@ -34,7 +34,9 @@ PLATFORM_TARGETS = {
 # Every NEW discovery lead must already have a public email + source URL BEFORE scoring.
 # At most 6 paid web Responses are allowed (initial + one refill per platform),
 # and each response is capped at 3 built-in web-search calls via max_tool_calls.
-SCORE_BATCH_SIZE = 25
+SCORE_BATCH_SIZE = 8
+SCORE_BATCH_ATTEMPTS = 2
+SCORE_MAX_OUTPUT_TOKENS = 5000
 MAX_WEB_RESPONSES = 6
 MAX_TOOL_CALLS_PER_WEB_RESPONSE = 3
 INITIAL_DISCOVERY_MULTIPLIER = 2
@@ -1153,7 +1155,10 @@ Use web search efficiently. This response is capped programmatically at
             store=False,
         )
         record_openai_usage(response, WEB_MODEL)
-        data = json.loads(response.output_text)
+        data = parse_structured_json(
+            response,
+            f"{platform} {pass_label} contact discovery",
+        )
     except Exception as exc:
         print(f"{platform} {pass_label} web discovery failed safely: {type(exc).__name__}: {exc}")
         return []
@@ -1172,6 +1177,42 @@ Use web search efficiently. This response is capped programmatically at
         + (f"; {rejected} rejected by hard contact validation." if rejected else ".")
     )
     return good
+
+
+# ============================================================
+# SAFE STRUCTURED-OUTPUT PARSING
+# ============================================================
+
+
+def response_status_summary(response):
+    status = str(getattr(response, "status", "") or "unknown")
+    details = getattr(response, "incomplete_details", None)
+    if details:
+        return f"status={status}, incomplete_details={details}"
+    return f"status={status}"
+
+
+def parse_structured_json(response, label):
+    """Parse a completed structured-output response without ever feeding empty text to json.loads."""
+    status = str(getattr(response, "status", "") or "")
+    text = str(getattr(response, "output_text", "") or "").strip()
+
+    if status and status != "completed":
+        raise RuntimeError(f"{label}: response did not complete ({response_status_summary(response)})")
+    if not text:
+        raise RuntimeError(f"{label}: response.output_text was empty ({response_status_summary(response)})")
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        preview = text[:180].replace("\\n", " ")
+        raise RuntimeError(
+            f"{label}: structured output was not valid JSON: {exc}; preview={preview!r}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{label}: expected a JSON object, got {type(data).__name__}")
+    return data
 
 
 # ============================================================
@@ -1216,7 +1257,7 @@ def build_score_schema(song_names):
     }
 
 
-def score_batch(batch, songs):
+def score_batch_once(batch, songs):
     song_names = [s["song"] for s in songs]
     compact = [{
         "candidate_id": lead["candidate_id"],
@@ -1231,8 +1272,8 @@ def score_batch(batch, songs):
     prompt = f"""
 {HUXLEY_BRIEF}
 
-Strictly score every candidate. Do NOT use contactability in the score; email
-verification is a separate hard filter after scoring.
+Strictly score every candidate. Do NOT use contactability in the score; every candidate
+has already passed the separate public-email gate.
 
 Score components:
 - Aesthetic fit: 0-30
@@ -1247,6 +1288,7 @@ match_score MUST equal the five-component sum.
 For song matching compare every creator with the ACTIVE catalogue using mood,
 visual tags, energy, vocal/instrumental character, instrument, meaning, Best For
 and description. Pick one primary and one DIFFERENT alternative song.
+Keep each reason concise: no more than about 22 words.
 
 ACTIVE SONGS:
 {json.dumps(songs_for_prompt(songs), ensure_ascii=False)}
@@ -1257,8 +1299,9 @@ CANDIDATES:
 
     response = openai_client.responses.create(
         model=SCORE_MODEL,
+        reasoning={"effort": "minimal"},
         input=prompt,
-        max_output_tokens=9000,
+        max_output_tokens=SCORE_MAX_OUTPUT_TOKENS,
         text={
             "format": {
                 "type": "json_schema",
@@ -1270,7 +1313,60 @@ CANDIDATES:
         store=False,
     )
     record_openai_usage(response, SCORE_MODEL)
-    return json.loads(response.output_text).get("results", [])
+    data = parse_structured_json(response, "creator scoring")
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError("creator scoring: JSON object did not contain a results array")
+    if not results:
+        raise RuntimeError("creator scoring: results array was empty")
+    return results
+
+
+def score_batch(batch, songs, depth=0):
+    """Score a batch defensively. A malformed/incomplete model response can never kill the run."""
+    if not batch:
+        return []
+
+    last_error = None
+    for attempt in range(1, SCORE_BATCH_ATTEMPTS + 1):
+        try:
+            results = score_batch_once(batch, songs)
+            requested_ids = {str(x.get("candidate_id", "")) for x in batch}
+            returned = [
+                x for x in results
+                if isinstance(x, dict) and str(x.get("candidate_id", "")) in requested_ids
+            ]
+            if not returned:
+                raise RuntimeError("creator scoring: no returned candidate IDs matched this batch")
+            return returned
+        except Exception as exc:
+            last_error = exc
+            print(
+                f"Scoring response problem for batch of {len(batch)} "
+                f"(attempt {attempt}/{SCORE_BATCH_ATTEMPTS}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            if attempt < SCORE_BATCH_ATTEMPTS:
+                time.sleep(1)
+
+    # If a whole batch repeatedly fails, split it. This both reduces output size and
+    # prevents one problematic response from discarding every candidate in the run.
+    if len(batch) > 1:
+        midpoint = len(batch) // 2
+        left = batch[:midpoint]
+        right = batch[midpoint:]
+        print(
+            f"Splitting failed scoring batch of {len(batch)} into "
+            f"{len(left)} + {len(right)} and continuing..."
+        )
+        return score_batch(left, songs, depth + 1) + score_batch(right, songs, depth + 1)
+
+    creator = str(batch[0].get("creator", "unknown creator"))
+    print(
+        f"Skipping one candidate after repeated scoring-response failure: {creator}. "
+        f"Last error: {last_error}"
+    )
+    return []
 
 
 def score_candidates(candidates, songs):
@@ -1461,6 +1557,8 @@ def startup_self_check():
         )
     if MAX_WEB_RESPONSES != 6 or MAX_TOOL_CALLS_PER_WEB_RESPONSE != 3:
         raise RuntimeError("Cost-ceiling constants changed unexpectedly.")
+    if SCORE_BATCH_SIZE != 8 or SCORE_BATCH_ATTEMPTS != 2:
+        raise RuntimeError("Safe scoring-batch configuration changed unexpectedly.")
     print(f"ENGINE VERSION: {ENGINE_VERSION}")
     print("Startup self-check: PASS")
 
@@ -1478,6 +1576,7 @@ def main():
         f"{MAX_WEB_RESPONSES * MAX_TOOL_CALLS_PER_WEB_RESPONSE} max web-search calls."
     )
     print("Existing rows are used ONLY for deduplication; they do NOT satisfy this run's 60-new-lead target.")
+    print("Safe scoring: 8 creators/batch + retry + automatic split on empty/incomplete JSON.")
 
     # Fail before any paid OpenAI request if Sheets or Songs are broken.
     verify_sheet_before_spending()
