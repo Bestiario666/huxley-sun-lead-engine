@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """Huxley Sun automation gate.
 
-Purpose:
-- Read the existing Leads sheet using the service account.
-- Count genuinely send-ready rows.
-- Tell GitHub Actions whether discovery should run.
-- Spend zero OpenAI credits.
+Reads the Leads sheet and decides whether paid discovery should run.
 
 A row counts as READY only when:
 - Status == READY
@@ -14,8 +10,9 @@ A row counts as READY only when:
 - Outreach Subject is present
 - Outreach Body is present
 
-The script fails closed if the sheet/schema cannot be read, so a broken
-spreadsheet does not accidentally trigger paid discovery.
+This script uses zero OpenAI calls.
+It fails closed: if the sheet cannot be read or the schema is wrong,
+the GitHub workflow fails instead of triggering paid discovery.
 """
 
 from __future__ import annotations
@@ -29,14 +26,10 @@ from typing import Dict, List
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-VERSION = "HS-PIPELINE-GATE-V1-20260808"
-
+VERSION = "HS-PIPELINE-GATE-V2-20260808"
 LEADS_TAB = "Leads"
 DEFAULT_THRESHOLD = 30
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly"
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 REQUIRED_HEADERS = {
     "Status",
@@ -46,39 +39,25 @@ REQUIRED_HEADERS = {
     "Outreach Body",
 }
 
-
 def env_required(name: str) -> str:
     value = os.environ.get(name, "").strip()
-
     if not value:
-        raise RuntimeError(
-            f"Missing required environment variable: {name}"
-        )
-
+        raise RuntimeError(f"Missing required environment variable: {name}")
     return value
-
 
 def normalize(value) -> str:
     return str(value or "").strip()
 
-
 def build_sheets_service():
     raw = env_required("GOOGLE_SERVICE_ACCOUNT_JSON")
-
     try:
         info = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON"
-        ) from exc
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON") from exc
 
-    credentials = (
-        service_account.Credentials.from_service_account_info(
-            info,
-            scopes=SCOPES,
-        )
+    credentials = service_account.Credentials.from_service_account_info(
+        info, scopes=SCOPES
     )
-
     return build(
         "sheets",
         "v4",
@@ -86,20 +65,12 @@ def build_sheets_service():
         cache_discovery=False,
     )
 
-
-def read_leads_values(
-    service,
-    spreadsheet_id: str,
-) -> List[List[str]]:
-
+def read_leads_values(service, spreadsheet_id: str) -> List[List[str]]:
     last_error = None
-
     for attempt in range(1, 5):
-
         try:
             result = (
-                service
-                .spreadsheets()
+                service.spreadsheets()
                 .values()
                 .get(
                     spreadsheetId=spreadsheet_id,
@@ -108,244 +79,113 @@ def read_leads_values(
                 )
                 .execute()
             )
-
             return result.get("values", [])
-
         except Exception as exc:
             last_error = exc
-
             if attempt == 4:
                 break
-
             wait = 2 ** (attempt - 1)
-
             print(
-                f"Google Sheets read failed; "
-                f"retry {attempt}/4 in {wait}s: "
+                f"Google Sheets read failed; retry {attempt}/4 in {wait}s: "
                 f"{type(exc).__name__}"
             )
-
             time.sleep(wait)
 
     raise RuntimeError(
-        f"Could not read Leads sheet after retries: "
-        f"{last_error}"
+        f"Could not read Leads sheet after retries: {last_error}"
     )
 
-
-def row_dict(
-    headers: List[str],
-    row: List[str],
-) -> Dict[str, str]:
-
-    padded = list(row) + [""] * max(
-        0,
-        len(headers) - len(row)
-    )
-
+def row_dict(headers: List[str], row: List[str]) -> Dict[str, str]:
+    padded = list(row) + [""] * max(0, len(headers) - len(row))
     return {
         headers[i]: normalize(padded[i])
         for i in range(len(headers))
     }
 
-
-def is_send_ready(
-    record: Dict[str, str]
-) -> bool:
-
-    status = record.get(
-        "Status",
-        "",
-    ).upper()
-
-    quality = record.get(
-        "Email Quality",
-        "",
-    ).upper()
-
+def is_send_ready(record: Dict[str, str]) -> bool:
+    status = record.get("Status", "").upper()
+    quality = record.get("Email Quality", "").upper()
     return (
         status == "READY"
-        and quality in {
-            "DIRECT",
-            "REPRESENTATIVE",
-        }
+        and quality in {"DIRECT", "REPRESENTATIVE"}
         and bool(record.get("Email"))
         and bool(record.get("Outreach Subject"))
         and bool(record.get("Outreach Body"))
     )
 
-
-def set_github_output(
-    name: str,
-    value: str,
-) -> None:
-
-    output_file = os.environ.get(
-        "GITHUB_OUTPUT",
-        "",
-    ).strip()
-
+def set_github_output(name: str, value: str) -> None:
+    output_file = os.environ.get("GITHUB_OUTPUT", "").strip()
     if not output_file:
         return
-
-    with open(
-        output_file,
-        "a",
-        encoding="utf-8",
-    ) as fh:
-        fh.write(
-            f"{name}={value}\n"
-        )
-
+    with open(output_file, "a", encoding="utf-8") as fh:
+        fh.write(f"{name}={value}\n")
 
 def main() -> int:
+    print(f"ENGINE VERSION: {VERSION}")
 
-    print(
-        f"ENGINE VERSION: {VERSION}"
-    )
-
-    spreadsheet_id = env_required(
-        "GOOGLE_SHEET_ID"
-    )
-
+    spreadsheet_id = env_required("GOOGLE_SHEET_ID")
     threshold_raw = os.environ.get(
-        "READY_REFILL_THRESHOLD",
-        str(DEFAULT_THRESHOLD),
+        "READY_REFILL_THRESHOLD", str(DEFAULT_THRESHOLD)
     ).strip()
 
     try:
-        threshold = int(
-            threshold_raw
-        )
+        threshold = int(threshold_raw)
     except ValueError as exc:
         raise RuntimeError(
-            "READY_REFILL_THRESHOLD "
-            "must be an integer"
+            "READY_REFILL_THRESHOLD must be an integer"
         ) from exc
 
     if threshold < 1:
         raise RuntimeError(
-            "READY_REFILL_THRESHOLD "
-            "must be at least 1"
+            "READY_REFILL_THRESHOLD must be at least 1"
         )
 
     service = build_sheets_service()
-
-    values = read_leads_values(
-        service,
-        spreadsheet_id,
-    )
+    values = read_leads_values(service, spreadsheet_id)
 
     if not values:
-        raise RuntimeError(
-            "Leads sheet is empty "
-            "or unreadable"
-        )
+        raise RuntimeError("Leads sheet is empty or unreadable")
 
-    headers = [
-        normalize(x)
-        for x in values[0]
-    ]
-
-    missing = sorted(
-        REQUIRED_HEADERS - set(headers)
-    )
+    headers = [normalize(x) for x in values[0]]
+    missing = sorted(REQUIRED_HEADERS - set(headers))
 
     if missing:
         raise RuntimeError(
-            "Leads sheet is missing "
-            "required outreach columns: "
+            "Leads sheet is missing required outreach columns: "
             + ", ".join(missing)
         )
 
-    ready_count = 0
-
-    for row in values[1:]:
-
-        record = row_dict(
-            headers,
-            row,
-        )
-
-        if is_send_ready(record):
-            ready_count += 1
-
-    run_discovery = (
-        ready_count < threshold
+    ready_count = sum(
+        1
+        for row in values[1:]
+        if is_send_ready(row_dict(headers, row))
     )
 
-    print(
-        "======================================"
-    )
+    run_discovery = ready_count < threshold
 
-    print(
-        "HUXLEY SUN AUTOMATION GATE"
-    )
-
-    print(
-        "======================================"
-    )
-
-    print(
-        f"Verified READY queue: "
-        f"{ready_count}"
-    )
-
-    print(
-        f"Refill threshold: "
-        f"{threshold}"
-    )
+    print("======================================")
+    print("HUXLEY SUN AUTOMATION GATE")
+    print("======================================")
+    print(f"Verified READY queue: {ready_count}")
+    print(f"Refill threshold: {threshold}")
 
     if run_discovery:
-
-        print(
-            "Decision: RUN discovery once, "
-            "then prepare the new leads."
-        )
-
+        print("Decision: RUN discovery once, then prepare the new leads.")
     else:
+        print("Decision: SKIP paid discovery; READY queue is healthy.")
 
-        print(
-            "Decision: SKIP paid discovery; "
-            "the READY queue is healthy."
-        )
+    print("OpenAI cost for this gate: $0")
 
-    print(
-        "OpenAI cost for this gate: $0"
-    )
-
-    set_github_output(
-        "ready_count",
-        str(ready_count),
-    )
-
+    set_github_output("ready_count", str(ready_count))
     set_github_output(
         "run_discovery",
-        (
-            "true"
-            if run_discovery
-            else "false"
-        ),
+        "true" if run_discovery else "false",
     )
-
     return 0
 
-
 if __name__ == "__main__":
-
     try:
-        raise SystemExit(
-            main()
-        )
-
+        raise SystemExit(main())
     except Exception as exc:
-
-        print(
-            f"GATE ERROR: {exc}",
-            file=sys.stderr,
-        )
-
-        # Fail closed.
-        # A sheet problem must NOT trigger
-        # paid discovery by accident.
+        print(f"GATE ERROR: {exc}", file=sys.stderr)
         raise
