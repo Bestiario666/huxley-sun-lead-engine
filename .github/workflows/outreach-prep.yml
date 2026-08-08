@@ -1,13 +1,33 @@
-name: Huxley Sun Outreach Prep
+name: Huxley Sun Outreach Prep - Manual Backup
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: huxley-sun-automatic-pipeline
+  cancel-in-progress: false
+
 jobs:
-  prepare-outreach:
+
+  prepare-outreach-manually:
+
     runs-on: ubuntu-latest
 
+    timeout-minutes: 30
+
+    env:
+
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
     steps:
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -15,15 +35,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Validate outreach prep
+        run: |
+          test -f outreach_prep.py
+
+          python -m py_compile \
+            outreach_prep.py
+
+          echo "Outreach prep validation: PASS"
+
       - name: Prepare outreach drafts
         run: python outreach_prep.py
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
