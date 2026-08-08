@@ -15,27 +15,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-
   huxley-sun-pipeline:
-
     runs-on: ubuntu-latest
-
     timeout-minutes: 60
 
     env:
-
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
       YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-
       READY_REFILL_THRESHOLD: "30"
 
     steps:
-
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -63,20 +54,23 @@ jobs:
 
           echo "Pipeline file validation: PASS"
 
-      - name: Prepare any existing NEW leads first
+      # Always prepare any currently waiting NEW leads first.
+      # This costs no web-search calls in your current outreach_prep.py.
+      - name: Prepare existing NEW leads
         run: python outreach_prep.py
 
-      - name: Check whether the READY queue needs a refill
+      # The gate checks the actual READY queue after preparation.
+      - name: Check whether READY queue needs refill
         id: gate
         run: python pipeline_gate.py
 
-      - name: Queue is healthy - skip paid discovery
+      - name: Queue healthy - skip paid discovery
         if: steps.gate.outputs.run_discovery == 'false'
         run: |
           echo "READY queue: ${{ steps.gate.outputs.ready_count }}"
           echo "Paid discovery skipped."
-          echo "OpenAI discovery cost: $0"
 
+      # Maximum one paid discovery run per scheduled pipeline execution.
       - name: Run lead discovery once
         if: steps.gate.outputs.run_discovery == 'true'
         run: python lead_search.py
