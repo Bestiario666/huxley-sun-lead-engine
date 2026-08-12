@@ -55,7 +55,7 @@ from openai import OpenAI
 # VERSION / CONFIG
 # ============================================================
 
-ENGINE_VERSION = "HS-OUTREACH-PREP-V4-STRUCTURED-20260810"
+ENGINE_VERSION = "HS-OUTREACH-PREP-V5-HUMAN-MUTUAL-20260812"
 
 LEADS_TAB = "Leads"
 SONGS_TAB = "Songs"
@@ -69,7 +69,7 @@ MODEL_ATTEMPTS = 2
 MIN_MATCH_SCORE = 80
 
 # Keep drafts polished but concise.
-DRAFT_MAX_OUTPUT_TOKENS = 8000
+DRAFT_MAX_OUTPUT_TOKENS = 3000
 CONTACT_MAX_OUTPUT_TOKENS = 3500
 
 # Approximate current nano pricing used only for the terminal estimate.
@@ -1107,9 +1107,6 @@ def draft_schema(song_names: list[str]) -> dict[str, Any]:
                         "primary_song_match": {"type": "integer", "minimum": 0, "maximum": 100},
                         "alternative_song": {"type": "string", "enum": song_names},
                         "alternative_song_match": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "subject": {"type": "string"},
-                        "body": {"type": "string"},
-                        "follow_up": {"type": "string"},
                     },
                     "required": [
                         "row_number",
@@ -1119,9 +1116,6 @@ def draft_schema(song_names: list[str]) -> dict[str, Any]:
                         "primary_song_match",
                         "alternative_song",
                         "alternative_song_match",
-                        "subject",
-                        "body",
-                        "follow_up",
                     ],
                     "additionalProperties": False,
                 },
@@ -1151,61 +1145,19 @@ def draft_batch(batch: list[dict[str, Any]], songs: list[dict[str, str]]) -> lis
         })
 
     prompt = f"""
-You are preparing concise, polished cold outreach for Huxley Sun, an independent music project with a cinematic, reflective catalogue.
+You are matching Huxley Sun songs to visual creators for a small, selective outreach project.
 
-The recipient is a filmmaker, photographer, director, or visual creator. The email should feel like a thoughtful artist-to-artist introduction, not a sales pitch.
+Do NOT write any email copy. The email wording is fixed in Python so it remains human, consistent and honest.
 
-GOAL
-Build a simple creative connection with visual creators whose work genuinely fits Huxley Sun. The creator should feel welcome to use the suggested track in a reel or social post if it suits what they are making.
+For every lead:
+1. Pick the best ACTIVE primary song.
+2. Pick a DIFFERENT ACTIVE alternative song for internal use only.
+3. Give both song matches a 0 to 100 fit score.
+4. Give an Outreach Priority from 0 to 100 considering creator and music fit, realistic likelihood of response, creator scale, existing match score, and DIRECT contact slightly preferred to REPRESENTATIVE.
+5. Choose a natural greeting name. Use a person's first name where clear. For an organisation with no obvious person, use "there".
+6. Never invent projects, awards, clients, locations or facts about the creator.
 
-IMPORTANT
-- Do NOT mention licensing, licences, royalties, fees, contracts, permissions, clearance, sync rights, or discussing usage.
-- Do NOT imply they must contact Huxley Sun before using the music in a reel or post.
-- The Spotify link is for listening/reference. Never tell anyone to rip, download, extract, or record audio from Spotify.
-- Do NOT call Huxley Sun a filmmaker, photographer, director, or "fellow filmmaker."
-- Do NOT use phrases such as "mapped potential visual pairings", "visual language", "broader aim", "shot choices", or "if you'd like, I can share more."
-- Do NOT mention the alternative song in the email. The alternative is INTERNAL metadata only.
-- Use ONLY the supplied creator data and ACTIVE SONG catalogue. Do not invent projects, awards, clients, locations, or things you watched.
-
-FOR EVERY LEAD
-1. Pick the best ACTIVE primary song and a DIFFERENT ACTIVE alternative song.
-2. Give each song a 0-100 fit score.
-3. Give an Outreach Priority 0-100 considering:
-   - existing overall match score,
-   - realistic likelihood of response,
-   - creator scale,
-   - clear visual/music fit,
-   - DIRECT contact slightly preferred to REPRESENTATIVE.
-4. Choose a natural greeting name. For organizations use "there" if no person is obvious.
-5. Write a subject of 3-7 words.
-   - Human, specific, restrained.
-   - No clickbait.
-   - Never imply Huxley Sun is a filmmaker.
-6. Write the FIRST EMAIL in 70-105 words BEFORE links/signature.
-   It MUST have exactly these four blocks separated by blank lines:
-
-   BLOCK 1
-   Hi NAME,
-
-   BLOCK 2
-   ONE short sentence about one concrete supplied aspect of their work and why it stood out.
-
-   BLOCK 3
-   ONE or TWO short sentences introducing Huxley Sun as an independent music project and explaining that the outreach is about genuine creative fit, not simply promoting a release.
-
-   BLOCK 4
-   ONE or TWO short sentences naming ONLY the PRIMARY song, why it fits their work, and ending naturally with:
-   "If it fits something you're making, feel free to use it in a reel or post."
-
-   Keep paragraphs short. No paragraph may exceed three sentences.
-   Do NOT include URLs, social handles, or a signature; Python adds them.
-7. Write ONE gentle 30-50 word follow-up.
-   - Start with "Hi NAME,"
-   - Greeting + one short paragraph only.
-   - Briefly resurface the original note and primary-song fit.
-   - No guilt, urgency, sales language, URLs, social handles, or signature.
-
-All active Huxley Sun songs may be considered for reels, posts, short films, and documentaries. Best For is guidance, not a hard restriction.
+All active songs may be considered for reels, posts, short films and documentaries. "Best For" is guidance, not a hard restriction.
 
 ACTIVE SONGS:
 {json.dumps(song_prompt_payload(songs), ensure_ascii=False)}
@@ -1248,9 +1200,7 @@ def prepare_drafts(ready_leads: list[dict[str, Any]], songs: list[dict[str, str]
             lead["primary_song_match"] = max(0, min(100, parse_int(item.get("primary_song_match"), 0)))
             lead["alternative_song"] = clean(item.get("alternative_song"))
             lead["alternative_song_match"] = max(0, min(100, parse_int(item.get("alternative_song_match"), 0)))
-            lead["subject"] = clean(item.get("subject"))[:180]
-            lead["body_core"] = clean(item.get("body"))
-            lead["follow_up_core"] = clean(item.get("follow_up"))
+            lead["subject"] = "Music and visual work. Huxley Sun"
 
         for lead in batch:
             if lead["row_number"] not in returned:
@@ -1265,8 +1215,8 @@ def apply_song_links_and_final_text(leads: list[dict[str, Any]], songs: list[dic
         if lead.get("draft_failed"):
             continue
 
-        primary = lead.get("primary_song", "")
-        alternative = lead.get("alternative_song", "")
+        primary = clean(lead.get("primary_song"))
+        alternative = clean(lead.get("alternative_song"))
 
         if primary not in active_names or alternative not in active_names or primary == alternative:
             lead["draft_failed"] = True
@@ -1274,44 +1224,48 @@ def apply_song_links_and_final_text(leads: list[dict[str, Any]], songs: list[dic
 
         song = song_map[primary]
         alt = song_map[alternative]
-        greeting_name = lead.get("greeting_name") or first_name_guess(lead["creator"])
+        greeting_name = clean(lead.get("greeting_name")) or first_name_guess(lead["creator"]) or "there"
 
-        # Apply the no-licensing guard to the actual outbound body,
-        # then force clean paragraph structure.
-        body = organize_email_core(
-            lead.get("body_core"),
-            greeting_name,
+        lead["subject"] = "Music and visual work. Huxley Sun"
+
+        body = (
+            f"Hi {greeting_name},\n\n"
+            "Iâm behind Huxley Sun, an independent music project centred around cinematic and reflective music. "
+            "Lately Iâve been trying to connect the music more naturally with filmmakers, photographers and people making visual work.\n\n"
+            "I like the idea of the music existing alongside other creative work rather than only as standalone releases. "
+            "That could be through a track being used in a reel or post, imagery becoming part of something around Huxley Sun, "
+            "or simply keeping in touch and sharing work when something feels relevant.\n\n"
+            f"I thought {primary} would be a good place to start.\n\n"
+            f"{primary}\n{song['stream_url']}"
         )
-
-        if not body:
-            lead["draft_failed"] = True
-            continue
-
-        body += f"\n\n{primary}\n{song['stream_url']}"
 
         if song.get("more_music_url"):
             body += f"\n\nMore music\n{song['more_music_url']}"
 
         body += (
-            "\n\nBest,\n"
+            "\n\nIf something there works for what youâre making, feel free to use it.\n\n"
+            "Best,\n"
             "Huxley Sun\n"
             "Instagram / TikTok / Facebook: @huxleysun"
         )
 
-        follow = organize_follow_up_core(
-            lead.get("follow_up_core"),
-            greeting_name,
+        follow = (
+            f"Hi {greeting_name},\n\n"
+            "Just wanted to follow up in case my note got buried. "
+            "Iâm still interested in finding natural ways for Huxley Sun to sit alongside visual work, "
+            "whether through music, imagery or simply sharing things when they fit. "
+            f"No pressure at all. I thought {primary} was a good place to start.\n\n"
+            "Best,\n"
+            "Huxley Sun\n"
+            "Instagram / TikTok / Facebook: @huxleysun"
         )
 
-        if not follow:
+        body = body.replace("â", " ").replace("â", " ")
+        follow = follow.replace("â", " ").replace("â", " ")
+
+        if any(term in body.lower() for term in FORBIDDEN_OUTREACH_TERMS):
             lead["draft_failed"] = True
             continue
-
-        follow += (
-            "\n\nBest,\n"
-            "Huxley Sun\n"
-            "Instagram / TikTok / Facebook: @huxleysun"
-        )
 
         lead["song_link"] = song["stream_url"]
         lead["more_music_link"] = song.get("more_music_url", "")
@@ -1425,19 +1379,7 @@ def self_check() -> None:
     assert parse_followers("90.9K") == 90_900
     assert parse_followers("1M+ across platforms") == 1_000_000
     assert same_site("www.creator.co.uk", "mail.creator.co.uk")
-
-    sample = (
-        "Hi Matti, Your work has a calm pace. "
-        "I am behind Huxley Sun. I reach out selectively where the fit feels natural. "
-        "Hanging On feels suited to your landscapes. "
-        "I'd be happy to discuss licensing. "
-        "If it fits something you're making, feel free to use it in a reel or post."
-    )
-    organized = organize_email_core(sample, "Matti")
-    assert "licens" not in organized.lower()
-    assert organized.startswith("Hi Matti,\n\n")
-    assert organized.count("\n\n") >= 3
-
+    assert "Music and visual work. Huxley Sun" == "Music and visual work. Huxley Sun"
     print("Startup self-check: PASS")
 
 
